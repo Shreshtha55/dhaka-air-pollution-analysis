@@ -1,1 +1,621 @@
 
+1.Which days had the largest PM2.5 increases?
+query = """
+SELECT
+    date,
+    pm2_5,
+    LAG(pm2_5) OVER (ORDER BY date) AS previous_day_pm25,
+    ROUND(
+        pm2_5 - LAG(pm2_5) OVER (ORDER BY date),
+        2
+    ) AS daily_increase
+FROM air_quality
+WHERE pm2_5 IS NOT NULL
+ORDER BY daily_increase DESC
+LIMIT 10;
+"""
+
+result = con.execute(query).df()
+display(result)
+
+  
+2.What changed alongside those major increases?
+query = """
+WITH daily_changes AS (
+    SELECT
+        date,
+        pm2_5,
+        pm10,
+        carbon_monoxide,
+        nitrogen_dioxide,
+        sulphur_dioxide,
+        ozone,
+        temperature_2m_mean,
+        relative_humidity_2m_mean,
+        precipitation_sum,
+        wind_speed_10m_mean,
+        surface_pressure_mean,
+
+        LAG(pm2_5) OVER (ORDER BY date) AS previous_pm25,
+        LAG(pm10) OVER (ORDER BY date) AS previous_pm10,
+        LAG(carbon_monoxide) OVER (ORDER BY date) AS previous_co,
+        LAG(nitrogen_dioxide) OVER (ORDER BY date) AS previous_no2,
+        LAG(sulphur_dioxide) OVER (ORDER BY date) AS previous_so2,
+        LAG(ozone) OVER (ORDER BY date) AS previous_ozone,
+
+        LAG(temperature_2m_mean) OVER (ORDER BY date) AS previous_temp,
+        LAG(relative_humidity_2m_mean) OVER (ORDER BY date) AS previous_humidity,
+        LAG(precipitation_sum) OVER (ORDER BY date) AS previous_rain,
+        LAG(wind_speed_10m_mean) OVER (ORDER BY date) AS previous_wind,
+        LAG(surface_pressure_mean) OVER (ORDER BY date) AS previous_pressure
+
+    FROM air_quality
+)
+
+SELECT
+    date,
+    ROUND(pm2_5 - previous_pm25, 2) AS pm25_change,
+    ROUND(pm10 - previous_pm10, 2) AS pm10_change,
+    ROUND(carbon_monoxide - previous_co, 2) AS co_change,
+    ROUND(nitrogen_dioxide - previous_no2, 2) AS no2_change,
+    ROUND(sulphur_dioxide - previous_so2, 2) AS so2_change,
+    ROUND(ozone - previous_ozone, 2) AS ozone_change,
+    ROUND(temperature_2m_mean - previous_temp, 2) AS temperature_change,
+    ROUND(relative_humidity_2m_mean - previous_humidity, 2) AS humidity_change,
+    ROUND(precipitation_sum - previous_rain, 2) AS rainfall_change,
+    ROUND(wind_speed_10m_mean - previous_wind, 2) AS wind_change,
+    ROUND(surface_pressure_mean - previous_pressure, 2) AS pressure_change
+
+FROM daily_changes
+WHERE pm2_5 IS NOT NULL
+  AND previous_pm25 IS NOT NULL
+ORDER BY pm25_change DESC
+LIMIT 10;
+"""
+
+result = con.execute(query).df()
+display(result)
+
+
+3.Detect sustained pollution episodes
+
+query = """
+WITH threshold AS (
+    SELECT QUANTILE_CONT(pm2_5, 0.90) AS pm25_limit
+    FROM air_quality
+    WHERE pm2_5 IS NOT NULL
+),
+daily AS (
+    SELECT
+        CAST(date AS DATE) AS date,
+        AVG(pm2_5) AS pm2_5
+    FROM air_quality
+    WHERE pm2_5 IS NOT NULL
+    GROUP BY CAST(date AS DATE)
+),
+classified AS (
+    SELECT
+        d.date,
+        d.pm2_5,
+        CASE
+            WHEN d.pm2_5 > t.pm25_limit THEN 1
+            ELSE 0
+        END AS is_high
+    FROM daily d
+    CROSS JOIN threshold t
+),
+marked AS (
+    SELECT
+        *,
+        LAG(date) OVER (ORDER BY date) AS previous_date,
+        LAG(is_high) OVER (ORDER BY date) AS previous_high
+    FROM classified
+),
+episode_starts AS (
+    SELECT
+        *,
+        CASE
+            WHEN is_high = 1
+             AND (
+                 previous_high = 0
+                 OR previous_high IS NULL
+                 OR date != previous_date + INTERVAL '1 day'
+             )
+            THEN 1
+            ELSE 0
+        END AS new_episode
+    FROM marked
+),
+numbered AS (
+    SELECT
+        *,
+        SUM(new_episode) OVER (
+            ORDER BY date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS episode_id
+    FROM episode_starts
+),
+episodes AS (
+    SELECT
+        episode_id,
+        MIN(date) AS start_date,
+        MAX(date) AS end_date,
+        COUNT(*) AS duration_days,
+        ROUND(MAX(pm2_5), 2) AS peak_pm25,
+        ROUND(AVG(pm2_5), 2) AS average_pm25
+    FROM numbered
+    WHERE is_high = 1
+    GROUP BY episode_id
+)
+SELECT *
+FROM episodes
+WHERE duration_days >= 3
+ORDER BY peak_pm25 DESC;
+"""
+
+episodes = con.execute(query).df()
+display(episodes)
+
+4.Episode start and end dates 
+query = """
+WITH threshold AS (
+    SELECT QUANTILE_CONT(pm2_5, 0.90) AS pm25_limit
+    FROM air_quality
+    WHERE pm2_5 IS NOT NULL
+),
+daily AS (
+    SELECT
+        CAST(date AS DATE) AS date,
+        AVG(pm2_5) AS pm2_5
+    FROM air_quality
+    WHERE pm2_5 IS NOT NULL
+    GROUP BY CAST(date AS DATE)
+),
+classified AS (
+    SELECT
+        d.date,
+        d.pm2_5,
+        CASE WHEN d.pm2_5 > t.pm25_limit THEN 1 ELSE 0 END AS is_high
+    FROM daily d
+    CROSS JOIN threshold t
+),
+previous_values AS (
+    SELECT
+        *,
+        LAG(date) OVER (ORDER BY date) AS previous_date,
+        LAG(is_high) OVER (ORDER BY date) AS previous_high
+    FROM classified
+),
+episode_flags AS (
+    SELECT
+        *,
+        CASE
+            WHEN is_high = 1
+             AND (
+                 previous_high = 0
+                 OR previous_high IS NULL
+                 OR date != previous_date + INTERVAL '1 day'
+             )
+            THEN 1
+            ELSE 0
+        END AS episode_start
+    FROM previous_values
+),
+episode_groups AS (
+    SELECT
+        *,
+        SUM(episode_start) OVER (
+            ORDER BY date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS episode_id
+    FROM episode_flags
+),
+episodes AS (
+    SELECT
+        episode_id,
+        MIN(date) AS start_date,
+        MAX(date) AS end_date,
+        COUNT(*) AS duration_days,
+        ROUND(MAX(pm2_5), 2) AS peak_pm25,
+        ROUND(AVG(pm2_5), 2) AS average_pm25
+    FROM episode_groups
+    WHERE is_high = 1
+    GROUP BY episode_id
+)
+SELECT
+    start_date,
+    end_date,
+    duration_days,
+    peak_pm25,
+    average_pm25
+FROM episodes
+WHERE duration_days >= 3
+ORDER BY start_date;
+"""
+
+episodes = con.execute(query).df()
+display(episodes)
+
+5.growth rate of each episode
+query = """
+WITH threshold AS (
+    SELECT
+        QUANTILE_CONT(pm2_5, 0.90) AS pm25_limit
+    FROM air_quality
+    WHERE pm2_5 IS NOT NULL
+),
+
+daily AS (
+    SELECT
+        CAST(date AS DATE) AS date,
+        AVG(pm2_5) AS pm2_5,
+        AVG(pm10) AS pm10,
+        AVG(carbon_monoxide) AS co,
+        AVG(nitrogen_dioxide) AS no2,
+        AVG(sulphur_dioxide) AS so2,
+        AVG(ozone) AS ozone
+    FROM air_quality
+    GROUP BY CAST(date AS DATE)
+),
+
+classified AS (
+    SELECT
+        d.*,
+        CASE
+            WHEN d.pm2_5 > t.pm25_limit THEN 1
+            ELSE 0
+        END AS is_high
+    FROM daily d
+    CROSS JOIN threshold t
+),
+
+with_previous AS (
+    SELECT
+        *,
+        LAG(date) OVER (ORDER BY date) AS previous_date,
+        LAG(is_high) OVER (ORDER BY date) AS previous_high
+    FROM classified
+),
+
+episode_flags AS (
+    SELECT
+        *,
+        CASE
+            WHEN is_high = 1 AND (
+                previous_high = 0
+                OR previous_high IS NULL
+                OR date != previous_date + INTERVAL '1 day'
+            )
+            THEN 1
+            ELSE 0
+        END AS episode_start
+    FROM with_previous
+),
+
+numbered AS (
+    SELECT
+        *,
+        SUM(episode_start) OVER (
+            ORDER BY date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS episode_id
+    FROM episode_flags
+),
+
+episode_days AS (
+    SELECT *
+    FROM numbered
+    WHERE is_high = 1
+),
+
+valid_episodes AS (
+    SELECT episode_id
+    FROM episode_days
+    GROUP BY episode_id
+    HAVING COUNT(*) >= 3
+),
+
+episode_averages AS (
+    SELECT
+        e.episode_id,
+        MIN(e.date) AS start_date,
+        MAX(e.date) AS end_date,
+        COUNT(*) AS duration_days,
+        ROUND(AVG(e.pm2_5), 2) AS avg_pm25,
+        ROUND(AVG(e.pm10), 2) AS avg_pm10,
+        ROUND(AVG(e.co), 2) AS avg_co,
+        ROUND(AVG(e.no2), 2) AS avg_no2,
+        ROUND(AVG(e.so2), 2) AS avg_so2,
+        ROUND(AVG(e.ozone), 2) AS avg_ozone,
+
+        ROUND(
+            (
+                ARG_MAX(e.pm2_5, e.date) -
+                ARG_MIN(e.pm2_5, e.date)
+            ) / NULLIF(ARG_MIN(e.pm2_5, e.date), 0) * 100,
+            2
+        ) AS pm25_growth_rate
+
+    FROM episode_days e
+    JOIN valid_episodes v
+        ON e.episode_id = v.episode_id
+    GROUP BY e.episode_id
+)
+
+SELECT *
+FROM episode_averages
+ORDER BY duration_days DESC, avg_pm25 DESC;
+"""
+
+result = con.execute(query).df()
+result
+
+6.pollutants that are most consistently elevated during PM2.5 episodes
+
+query = """
+WITH threshold AS (
+    SELECT
+        QUANTILE_CONT(pm2_5, 0.90) AS pm25_limit
+    FROM air_quality
+    WHERE pm2_5 IS NOT NULL
+),
+
+daily AS (
+    SELECT
+        CAST(date AS DATE) AS date,
+        AVG(pm2_5) AS pm2_5,
+        AVG(pm10) AS pm10,
+        AVG(carbon_monoxide) AS co,
+        AVG(nitrogen_dioxide) AS no2,
+        AVG(sulphur_dioxide) AS so2,
+        AVG(ozone) AS ozone
+    FROM air_quality
+    GROUP BY CAST(date AS DATE)
+),
+
+classified AS (
+    SELECT
+        d.*,
+        CASE
+            WHEN d.pm2_5 > t.pm25_limit THEN 1
+            ELSE 0
+        END AS is_high
+    FROM daily d
+    CROSS JOIN threshold t
+),
+
+with_previous AS (
+    SELECT
+        *,
+        LAG(date) OVER (ORDER BY date) AS previous_date,
+        LAG(is_high) OVER (ORDER BY date) AS previous_high
+    FROM classified
+),
+
+episode_flags AS (
+    SELECT
+        *,
+        CASE
+            WHEN is_high = 1 AND (
+                previous_high = 0
+                OR previous_high IS NULL
+                OR date != previous_date + INTERVAL '1 day'
+            )
+            THEN 1
+            ELSE 0
+        END AS episode_start
+    FROM with_previous
+),
+
+numbered AS (
+    SELECT
+        *,
+        SUM(episode_start) OVER (
+            ORDER BY date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS episode_id
+    FROM episode_flags
+),
+
+episode_days AS (
+    SELECT *
+    FROM numbered
+    WHERE is_high = 1
+),
+
+valid_episodes AS (
+    SELECT episode_id
+    FROM episode_days
+    GROUP BY episode_id
+    HAVING COUNT(*) >= 3
+),
+
+valid_episode_days AS (
+    SELECT e.*
+    FROM episode_days e
+    JOIN valid_episodes v
+        ON e.episode_id = v.episode_id
+),
+
+normal_days AS (
+    SELECT *
+    FROM classified
+    WHERE is_high = 0
+),
+
+normal_thresholds AS (
+    SELECT
+        QUANTILE_CONT(pm10, 0.75) AS pm10_p75,
+        QUANTILE_CONT(co, 0.75) AS co_p75,
+        QUANTILE_CONT(no2, 0.75) AS no2_p75,
+        QUANTILE_CONT(so2, 0.75) AS so2_p75,
+        QUANTILE_CONT(ozone, 0.75) AS ozone_p75
+    FROM normal_days
+),
+
+episode_summary AS (
+    SELECT
+        AVG(pm10) AS avg_pm10,
+        AVG(co) AS avg_co,
+        AVG(no2) AS avg_no2,
+        AVG(so2) AS avg_so2,
+        AVG(ozone) AS avg_ozone,
+
+        COUNT(pm10) AS days_pm10,
+        COUNT(co) AS days_co,
+        COUNT(no2) AS days_no2,
+        COUNT(so2) AS days_so2,
+        COUNT(ozone) AS days_ozone,
+
+        COUNT(*) FILTER (
+            WHERE pm10 > t.pm10_p75
+        ) AS high_pm10_days,
+
+        COUNT(*) FILTER (
+            WHERE co > t.co_p75
+        ) AS high_co_days,
+
+        COUNT(*) FILTER (
+            WHERE no2 > t.no2_p75
+        ) AS high_no2_days,
+
+        COUNT(*) FILTER (
+            WHERE so2 > t.so2_p75
+        ) AS high_so2_days,
+
+        COUNT(*) FILTER (
+            WHERE ozone > t.ozone_p75
+        ) AS high_ozone_days
+
+    FROM valid_episode_days e
+    CROSS JOIN normal_thresholds t
+),
+
+normal_summary AS (
+    SELECT
+        AVG(pm10) AS avg_pm10,
+        AVG(co) AS avg_co,
+        AVG(no2) AS avg_no2,
+        AVG(so2) AS avg_so2,
+        AVG(ozone) AS avg_ozone
+    FROM normal_days
+)
+
+SELECT
+    'PM10' AS pollutant,
+    ROUND(e.avg_pm10, 2) AS episode_average,
+    ROUND(n.avg_pm10, 2) AS normal_average,
+    ROUND(t.pm10_p75, 2) AS normal_75th_percentile,
+    ROUND(
+        100.0 * e.high_pm10_days / NULLIF(e.days_pm10, 0), 2
+    ) AS episode_days_elevated,
+    ROUND(
+        100.0 * (e.avg_pm10 - n.avg_pm10)
+        / NULLIF(n.avg_pm10, 0), 2
+    ) AS average_increase_pct
+FROM episode_summary e
+CROSS JOIN normal_summary n
+CROSS JOIN normal_thresholds t
+
+UNION ALL
+
+SELECT
+    'CO',
+    ROUND(e.avg_co, 2),
+    ROUND(n.avg_co, 2),
+    ROUND(t.co_p75, 2),
+    ROUND(100.0 * e.high_co_days / NULLIF(e.days_co, 0), 2),
+    ROUND(
+        100.0 * (e.avg_co - n.avg_co)
+        / NULLIF(n.avg_co, 0), 2
+    )
+FROM episode_summary e
+CROSS JOIN normal_summary n
+CROSS JOIN normal_thresholds t
+
+UNION ALL
+
+SELECT
+    'NO2',
+    ROUND(e.avg_no2, 2),
+    ROUND(n.avg_no2, 2),
+    ROUND(t.no2_p75, 2),
+    ROUND(100.0 * e.high_no2_days / NULLIF(e.days_no2, 0), 2),
+    ROUND(
+        100.0 * (e.avg_no2 - n.avg_no2)
+        / NULLIF(n.avg_no2, 0), 2
+    )
+FROM episode_summary e
+CROSS JOIN normal_summary n
+CROSS JOIN normal_thresholds t
+
+UNION ALL
+
+SELECT
+    'SO2',
+    ROUND(e.avg_so2, 2),
+    ROUND(n.avg_so2, 2),
+    ROUND(t.so2_p75, 2),
+    ROUND(100.0 * e.high_so2_days / NULLIF(e.days_so2, 0), 2),
+    ROUND(
+        100.0 * (e.avg_so2 - n.avg_so2)
+        / NULLIF(n.avg_so2, 0), 2
+    )
+FROM episode_summary e
+CROSS JOIN normal_summary n
+CROSS JOIN normal_thresholds t
+
+UNION ALL
+
+SELECT
+    'Ozone',
+    ROUND(e.avg_ozone, 2),
+    ROUND(n.avg_ozone, 2),
+    ROUND(t.ozone_p75, 2),
+    ROUND(100.0 * e.high_ozone_days / NULLIF(e.days_ozone, 0), 2),
+    ROUND(
+        100.0 * (e.avg_ozone - n.avg_ozone)
+        / NULLIF(n.avg_ozone, 0), 2
+    )
+FROM episode_summary e
+CROSS JOIN normal_summary n
+CROSS JOIN normal_thresholds t
+
+ORDER BY episode_days_elevated DESC;
+"""
+
+result = con.execute(query).df()
+result
+
+7.Weather conditions that distinguish pollution episodes
+con.execute("""
+WITH threshold AS (
+    SELECT
+        QUANTILE_CONT(pm2_5, 0.90) AS threshold
+    FROM air_quality
+    WHERE pm2_5 IS NOT NULL
+),
+
+classified AS (
+    SELECT
+        *,
+        CASE
+            WHEN pm2_5 >= (SELECT threshold FROM threshold)
+            THEN 'Episode'
+            ELSE 'Non-episode'
+        END AS period
+    FROM air_quality
+)
+
+SELECT
+    period,
+    COUNT(*) AS observations,
+    ROUND(AVG(temperature_2m_mean), 2) AS avg_temperature,
+    ROUND(AVG(relative_humidity_2m_mean), 2) AS avg_humidity,
+    ROUND(AVG(precipitation_sum), 2) AS avg_precipitation,
+    ROUND(AVG(wind_speed_10m_mean), 2) AS avg_wind_speed,
+    ROUND(AVG(surface_pressure_mean), 2) AS avg_pressure
+FROM classified
+GROUP BY period
+ORDER BY period;
+""").fetchdf()
